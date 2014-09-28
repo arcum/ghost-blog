@@ -5,8 +5,28 @@ var path = require('path'),
     config;
 
 config = {
+    development: {
+        url: 'http://localhost:2368',
+        database: {
+            client: 'sqlite3',
+            connection: {
+                filename: path.join(__dirname, '/content/data/ghost-dev.db')
+            },
+            debug: false
+        },
+        server: {
+            // Host to be passed to node's `net.Server#listen()`
+            host: '127.0.0.1',
+            // Port to be passed to node's `net.Server#listen()`, for iisnode set this to `process.env.PORT`
+            port: '2368'
+        },
+        paths: {
+            contentPath: path.join(__dirname, '/content/')
+        }
+    },
     production: {
         url: process.env.MY_URL,
+        fileStorage: false,
         mail: {
             transport: 'sendgrid',
             host: 'smtp.sendgrid.net',
