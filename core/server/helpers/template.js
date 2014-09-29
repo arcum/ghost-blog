@@ -1,40 +1,68 @@
 var templates     = {},
-    nodefn        = require('when/node/function'),
-    fs            = require('fs'),
     hbs           = require('express-hbs'),
-    errors        = require('../errorHandling'),
-    path          = require('path'),
-    when          = require('when'),
-    config        = require('../config');
+    errors        = require('../errors');
 
 // ## Template utils
 
-// Compile a template for a handlebars helper
-templates.compileTemplate = function (templatePath) {
-    return nodefn.call(fs.readFile, templatePath).then(function (templateContents) {
-        return hbs.handlebars.compile(templateContents.toString());
-    }, errors.logAndThrowError);
+// Execute a template helper
+// All template helpers are register as partial view.
+templates.execute = function (name, context) {
+    var partial = hbs.handlebars.partials[name];
+
+    if (partial === undefined) {
+        errors.logAndThrowError('Template ' + name + ' not found.');
+        return;
+    }
+
+    // If the partial view is not compiled, it compiles and saves in handlebars
+    if (typeof partial === 'string') {
+        hbs.registerPartial(partial);
+    }
+
+    return new hbs.handlebars.SafeString(partial(context));
 };
 
-// Load a template for a handlebars helper
-templates.loadTemplate = function (name) {
-    var templateFileName = name + '.hbs',
-        // Check for theme specific version first
-        templatePath = path.join(config.paths().activeTheme, 'partials', templateFileName),
-        deferred = when.defer();
+// Given a theme object and a post object this will return
+// which theme template page should be used.
+// If given a post object that is a regular post
+// it will return 'post'.
+// If given a static post object it will return 'page'.
+// If given a static post object and a custom page template
+// exits it will return that page.
+templates.getThemeViewForPost = function (themePaths, post) {
+    var customPageView = 'page-' + post.slug,
+        view = 'post';
 
-    // Can't use nodefn here because exists just returns one parameter, true or false
-
-    fs.exists(templatePath, function (exists) {
-        if (!exists) {
-            // Fall back to helpers templates location
-            templatePath = path.join(config.paths().helperTemplates, templateFileName);
+    if (post.page) {
+        if (themePaths.hasOwnProperty(customPageView + '.hbs')) {
+            view = customPageView;
+        } else if (themePaths.hasOwnProperty('page.hbs')) {
+            view = 'page';
         }
+    }
 
-        templates.compileTemplate(templatePath).then(deferred.resolve, deferred.reject);
-    });
+    return view;
+};
 
-    return deferred.promise;
+// Given a theme object and a tag slug this will return
+// which theme template page should be used.
+// If no default or custom tag template exists then 'index'
+// will be returned
+// If no custom tag template exists but a default does then
+// 'tag' will be returned
+// If given a tag slug and a custom tag template
+// exits it will return that view.
+templates.getThemeViewForTag = function (themePaths, tag) {
+    var customTagView = 'tag-' + tag,
+        view = 'tag';
+
+    if (themePaths.hasOwnProperty(customTagView + '.hbs')) {
+        view = customTagView;
+    } else if (!themePaths.hasOwnProperty('tag.hbs')) {
+        view = 'index';
+    }
+
+    return view;
 };
 
 module.exports = templates;

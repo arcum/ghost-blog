@@ -1,469 +1,312 @@
 // # Ghost Data API
-// Provides access to the data model
+// Provides access from anywhere to the Ghost data layer.
+//
+// Ghost's JSON API is integral to the workings of Ghost, regardless of whether you want to access data internally,
+// from a theme, an app, or from an external app, you'll use the Ghost JSON API to do so.
 
-var Ghost        = require('../../ghost'),
-    _            = require('underscore'),
-    when         = require('when'),
-    errors       = require('../errorHandling'),
-    permissions  = require('../permissions'),
-    db           = require('./db'),
-    canThis      = permissions.canThis,
+var _              = require('lodash'),
+    Promise        = require('bluebird'),
+    config         = require('../config'),
+    // Include Endpoints
+    configuration  = require('./configuration'),
+    db             = require('./db'),
+    mail           = require('./mail'),
+    notifications  = require('./notifications'),
+    posts          = require('./posts'),
+    roles          = require('./roles'),
+    settings       = require('./settings'),
+    tags           = require('./tags'),
+    themes         = require('./themes'),
+    users          = require('./users'),
+    slugs          = require('./slugs'),
+    authentication = require('./authentication'),
+    uploads        = require('./upload'),
+    dataExport     = require('../data/export'),
+    errors         = require('../errors'),
 
-    ghost        = new Ghost(),
-    dataProvider = ghost.dataProvider,
-    posts,
-    users,
-    tags,
-    notifications,
-    settings,
-    requestHandler,
-    settingsObject,
-    settingsCollection,
-    settingsFilter,
-    filteredUserAttributes = ['password', 'created_by', 'updated_by', 'last_login'],
-    ONE_DAY = 86400000;
+    http,
+    formatHttpErrors,
+    addHeaders,
+    cacheInvalidationHeader,
+    locationHeader,
+    contentDispositionHeader,
+    init;
 
-// ## Posts
-posts = {
-    // #### Browse
+/**
+ * ### Init
+ * Initialise the API - populate the settings cache
+ * @return {Promise(Settings)} Resolves to Settings Collection
+ */
+init = function () {
+    return settings.updateSettingsCache();
+};
 
-    // **takes:** filter / pagination parameters
-    browse: function browse(options) {
+/**
+ * ### Cache Invalidation Header
+ * Calculate the header string for the X-Cache-Invalidate: header.
+ * The resulting string instructs any cache in front of the blog that request has occurred which invalidates any cached
+ * versions of the listed URIs.
+ *
+ * `/*` is used to mean the entire cache is invalid
+ *
+ * @private
+ * @param {Express.request} req Original HTTP Request
+ * @param {Object} result API method result
+ * @return {Promise(String)} Resolves to header string
+ */
+cacheInvalidationHeader = function (req, result) {
+    var parsedUrl = req._parsedUrl.pathname.replace(/^\/|\/$/g, '').split('/'),
+        method = req.method,
+        endpoint = parsedUrl[0],
+        id = parsedUrl[1],
+        cacheInvalidate,
+        jsonResult = result.toJSON ? result.toJSON() : result,
+        post,
+        hasStatusChanged,
+        wasDeleted,
+        wasPublishedUpdated;
 
-        // **returns:** a promise for a page of posts in a json object
-        //return dataProvider.Post.findPage(options);
-        return dataProvider.Post.findPage(options).then(function (result) {
-            var i = 0,
-                omitted = result;
+    if (method === 'POST' || method === 'PUT' || method === 'DELETE') {
+        if (endpoint === 'settings' || endpoint === 'users' || endpoint === 'db') {
+            cacheInvalidate = '/*';
+        } else if (endpoint === 'posts') {
+            post = jsonResult.posts[0];
+            hasStatusChanged = post.statusChanged;
+            wasDeleted = method === 'DELETE';
+            // Invalidate cache when post was updated but not when post is draft
+            wasPublishedUpdated = method === 'PUT' && post.status === 'published';
 
-            for (i = 0; i < omitted.posts.length; i = i + 1) {
-                omitted.posts[i].author = _.omit(omitted.posts[i].author, filteredUserAttributes);
-                omitted.posts[i].user = _.omit(omitted.posts[i].user, filteredUserAttributes);
-            }
-            return omitted;
-        });
-    },
+            // Remove the statusChanged value from the response
+            delete post.statusChanged;
 
-    // #### Read
-
-    // **takes:** an identifier (id or slug?)
-    read: function read(args) {
-        // **returns:** a promise for a single post in a json object
-
-        return dataProvider.Post.findOne(args).then(function (result) {
-            var omitted;
-
-            if (result) {
-                omitted = result.toJSON();
-                omitted.author = _.omit(omitted.author, filteredUserAttributes);
-                omitted.user = _.omit(omitted.user, filteredUserAttributes);
-                return omitted;
-            }
-            return when.reject({errorCode: 404, message: 'Post not found'});
-
-        });
-    },
-
-    // #### Edit
-
-    // **takes:** a json object with all the properties which should be updated
-    edit: function edit(postData) {
-        // **returns:** a promise for the resulting post in a json object
-        if (!this.user) {
-            return when.reject({errorCode: 403, message: 'You do not have permission to edit this post.'});
-        }
-        var self = this;
-        return canThis(self.user).edit.post(postData.id).then(function () {
-            return dataProvider.Post.edit(postData).then(function (result) {
-                if (result) {
-                    var omitted = result.toJSON();
-                    omitted.author = _.omit(omitted.author, filteredUserAttributes);
-                    omitted.user = _.omit(omitted.user, filteredUserAttributes);
-                    return omitted;
+            // Don't set x-cache-invalidate header for drafts
+            if (hasStatusChanged || wasDeleted || wasPublishedUpdated) {
+                cacheInvalidate = '/, /page/*, /rss/, /rss/*, /tag/*, /author/*';
+                if (id && post.slug) {
+                    return config.urlForPost(settings, post).then(function (postUrl) {
+                        return cacheInvalidate + ', ' + postUrl;
+                    });
                 }
-                return when.reject({errorCode: 404, message: 'Post not found'});
-            }).otherwise(function (error) {
-                return dataProvider.Post.findOne({id: postData.id, status: 'all'}).then(function (result) {
-                    if (!result) {
-                        return when.reject({errorCode: 404, message: 'Post not found'});
-                    }
-                    return when.reject({message: error.message});
-                });
-            });
-        }, function () {
-            return when.reject({errorCode: 403, message: 'You do not have permission to edit this post.'});
-        });
-    },
-
-    // #### Add
-
-    // **takes:** a json object representing a post,
-    add: function add(postData) {
-        // **returns:** a promise for the resulting post in a json object
-        if (!this.user) {
-            return when.reject({errorCode: 403, message: 'You do not have permission to add posts.'});
+            }
         }
+    }
 
-        return canThis(this.user).create.post().then(function () {
-            return dataProvider.Post.add(postData);
-        }, function () {
-            return when.reject({errorCode: 403, message: 'You do not have permission to add posts.'});
-        });
-    },
+    return Promise.resolve(cacheInvalidate);
+};
 
-    // #### Destroy
+/**
+ * ### Location Header
+ *
+ * If the API request results in the creation of a new object, construct a Location: header which points to the new
+ * resource.
+ *
+ * @private
+ * @param {Express.request} req Original HTTP Request
+ * @param {Object} result API method result
+ * @return {Promise(String)} Resolves to header string
+ */
+locationHeader = function (req, result) {
+    var apiRoot = config.urlFor('api'),
+        location,
+        newObject;
 
-    // **takes:** an identifier (id or slug?)
-    destroy: function destroy(args) {
-        // **returns:** a promise for a json response with the id of the deleted post
-        if (!this.user) {
-            return when.reject({errorCode: 403, message: 'You do not have permission to remove posts.'});
+    if (req.method === 'POST') {
+        if (result.hasOwnProperty('posts')) {
+            newObject = result.posts[0];
+            location = apiRoot + '/posts/' + newObject.id + '/?status=' + newObject.status;
+        } else if (result.hasOwnProperty('notifications')) {
+            newObject = result.notifications[0];
+            location = apiRoot + '/notifications/' + newObject.id;
+        } else if (result.hasOwnProperty('users')) {
+            newObject = result.users[0];
+            location = apiRoot + '/users/' + newObject.id;
         }
-
-        return canThis(this.user).remove.post(args.id).then(function () {
-            return when(posts.read({id : args.id, status: 'all'})).then(function (result) {
-                return dataProvider.Post.destroy(args.id).then(function () {
-                    var deletedObj = {};
-                    deletedObj.id = result.id;
-                    deletedObj.slug = result.slug;
-                    return deletedObj;
-                });
-            });
-        }, function () {
-            return when.reject({errorCode: 403, message: 'You do not have permission to remove posts.'});
-        });
     }
+
+    return Promise.resolve(location);
 };
 
-// ## Users
-users = {
-    // #### Browse
-
-    // **takes:** options object
-    browse: function browse(options) {
-        // **returns:** a promise for a collection of users in a json object
-
-        return dataProvider.User.browse(options).then(function (result) {
-            var i = 0,
-                omitted = {};
-
-            if (result) {
-                omitted = result.toJSON();
-            }
-
-            for (i = 0; i < omitted.length; i = i + 1) {
-                omitted[i] = _.omit(omitted[i], filteredUserAttributes);
-            }
-
-            return omitted;
-        });
-    },
-
-    // #### Read
-
-    // **takes:** an identifier (id or slug?)
-    read: function read(args) {
-        // **returns:** a promise for a single user in a json object
-        if (args.id === 'me') {
-            args = {id: this.user};
-        }
-
-        return dataProvider.User.read(args).then(function (result) {
-            if (result) {
-                var omitted = _.omit(result.toJSON(), filteredUserAttributes);
-                return omitted;
-            }
-
-            return when.reject({errorCode: 404, message: 'User not found'});
-        });
-    },
-
-    // #### Edit
-
-    // **takes:** a json object representing a user
-    edit: function edit(userData) {
-        // **returns:** a promise for the resulting user in a json object
-        userData.id = this.user;
-        return dataProvider.User.edit(userData).then(function (result) {
-            if (result) {
-                var omitted = _.omit(result.toJSON(), filteredUserAttributes);
-                return omitted;
-            }
-            return when.reject({errorCode: 404, message: 'User not found'});
-        });
-    },
-
-    // #### Add
-
-    // **takes:** a json object representing a user
-    add: function add(userData) {
-
-        // **returns:** a promise for the resulting user in a json object
-        return dataProvider.User.add(userData);
-    },
-
-    // #### Check
-    // Checks a password matches the given email address
-
-    // **takes:** a json object representing a user
-    check: function check(userData) {
-        // **returns:** on success, returns a promise for the resulting user in a json object
-        return dataProvider.User.check(userData);
-    },
-
-    // #### Change Password
-
-    // **takes:** a json object representing a user
-    changePassword: function changePassword(userData) {
-        // **returns:** on success, returns a promise for the resulting user in a json object
-        return dataProvider.User.changePassword(userData);
-    },
-
-    generateResetToken: function generateResetToken(email) {
-        // TODO: Do we want to be able to pass this in?
-        var expires = Date.now() + ONE_DAY;
-
-        return dataProvider.User.generateResetToken(email, expires, ghost.dbHash);
-    },
-
-    validateToken: function validateToken(token) {
-        return dataProvider.User.validateToken(token, ghost.dbHash);
-    },
-
-    resetPassword: function resetPassword(token, newPassword, ne2Password) {
-        return dataProvider.User.resetPassword(token, newPassword, ne2Password, ghost.dbHash);
-    }
-};
-
-tags = {
-    // #### All
-
-    // **takes:** Nothing yet
-    all: function browse() {
-        // **returns:** a promise for all tags which have previously been used in a json object
-        return dataProvider.Tag.findAll();
-    }
-};
-
-// ## Notifications
-notifications = {
-    // #### Destroy
-
-    // **takes:** an identifier (id)
-    destroy: function destroy(i) {
-        ghost.notifications = _.reject(ghost.notifications, function (element) {
-            return element.id === i.id;
-        });
-        // **returns:** a promise for remaining notifications as a json object
-        return when(ghost.notifications);
-    },
-
-    // #### Add
-
-    // **takes:** a notification object of the form
-    // ```
-    //  msg = {
-    //      type: 'error', // this can be 'error', 'success', 'warn' and 'info'
-    //      message: 'This is an error', // A string. Should fit in one line.
-    //      status: 'persistent', // or 'passive'
-    //      id: 'auniqueid' // A unique ID
-    //  };
-    // ```
-    add: function add(notification) {
-        // **returns:** a promise for all notifications as a json object
-        return when(ghost.notifications.push(notification));
-    }
-};
-
-// ## Settings
-
-// ### Helpers
-// Turn a settings collection into a single object/hashmap
-settingsObject = function (settings) {
-    if (_.isObject(settings)) {
-        return _.reduce(settings, function (res, item, key) {
-            if (_.isArray(item)) {
-                res[key] = item;
-            } else {
-                res[key] = item.value;
-            }
-            return res;
-        }, {});
-    }
-    return (settings.toJSON ? settings.toJSON() : settings).reduce(function (res, item) {
-        if (item.toJSON) { item = item.toJSON(); }
-        if (item.key) { res[item.key] = item.value; }
-        return res;
-    }, {});
-};
-// Turn an object into a collection
-settingsCollection = function (settings) {
-    return _.map(settings, function (value, key) {
-        return { key: key, value: value };
+/**
+ * ### Content Disposition Header
+ * create a header that invokes the 'Save As' dialog in the browser when exporting the database to file. The 'filename'
+ * parameter is governed by [RFC6266](http://tools.ietf.org/html/rfc6266#section-4.3).
+ *
+ * For encoding whitespace and non-ISO-8859-1 characters, you MUST use the "filename*=" attribute, NOT "filename=".
+ * Ideally, both. Examples: http://tools.ietf.org/html/rfc6266#section-5
+ *
+ * We'll use ISO-8859-1 characters here to keep it simple.
+ *
+ * @private
+ * @see http://tools.ietf.org/html/rfc598
+ * @return {string}
+ */
+contentDispositionHeader = function () {
+    return dataExport.fileName().then(function (filename) {
+        return 'Attachment; filename="' + filename + '"';
     });
 };
 
-// Filters an object based on a given filter object
-settingsFilter = function (settings, filter) {
-    return _.object(_.filter(_.pairs(settings), function (setting) {
-        if (filter) {
-            return _.some(filter.split(','), function (f) {
-                return setting[1].type === f;
-            });
-        }
-        return true;
-    }));
+/**
+ * ### Format HTTP Errors
+ * Converts the error response from the API into a format which can be returned over HTTP
+ *
+ * @private
+ * @param {Array} error
+ * @return {{errors: Array, statusCode: number}}
+ */
+formatHttpErrors = function (error) {
+    var statusCode = 500,
+        errors = [];
+
+    if (!_.isArray(error)) {
+        error = [].concat(error);
+    }
+
+    _.each(error, function (errorItem) {
+        var errorContent = {};
+
+        // TODO: add logic to set the correct status code
+        statusCode = errorItem.code || 500;
+
+        errorContent.message = _.isString(errorItem) ? errorItem :
+            (_.isObject(errorItem) ? errorItem.message : 'Unknown API Error');
+        errorContent.type = errorItem.type || 'InternalServerError';
+        errors.push(errorContent);
+    });
+
+    return {errors: errors, statusCode: statusCode};
 };
 
-settings = {
-    // #### Browse
+addHeaders = function (apiMethod, req, res, result) {
+    var ops = [],
+        cacheInvalidation,
+        location,
+        contentDisposition;
 
-    // **takes:** options object
-    browse: function browse(options) {
-        // **returns:** a promise for a settings json object
-        if (ghost.settings()) {
-            return when(ghost.settings()).then(function (settings) {
-                //TODO: omit where type==core
-                return settingsObject(settingsFilter(settings, options.type));
-            }, errors.logAndThrowError);
-        }
-    },
-
-    // #### Read
-
-    // **takes:** either a json object containing a key, or a single key string
-    read: function read(options) {
-        if (_.isString(options)) {
-            options = { key: options };
-        }
-
-        if (ghost.settings()) {
-            return when(ghost.settings()[options.key]).then(function (setting) {
-                if (!setting) {
-                    return when.reject({errorCode: 404, message: 'Unable to find setting: ' + options.key});
-                }
-                var res = {};
-                res.key = options.key;
-                res.value = setting.value;
-                return res;
-            }, errors.logAndThrowError);
-        }
-    },
-
-    // #### Edit
-
-     // **takes:** either a json object representing a collection of settings, or a key and value pair
-    edit: function edit(key, value) {
-        // Check for passing a collection of settings first
-        if (_.isObject(key)) {
-            //clean data
-            var type = key.type;
-            delete key.type;
-            delete key.availableThemes;
-
-            key = settingsCollection(key);
-            return dataProvider.Settings.edit(key).then(function (result) {
-                result.models = result;
-                return when(ghost.readSettingsResult(result)).then(function (settings) {
-                    ghost.updateSettingsCache(settings);
-                    return settingsObject(settingsFilter(ghost.settings(), type));
-                });
-            }).otherwise(function (error) {
-                return dataProvider.Settings.read(key.key).then(function (result) {
-                    if (!result) {
-                        return when.reject({errorCode: 404, message: 'Unable to find setting: ' + key});
-                    }
-                    return when.reject({message: error.message});
-                });
-            });
-        }
-        return dataProvider.Settings.read(key).then(function (setting) {
-            if (!setting) {
-                return when.reject({errorCode: 404, message: 'Unable to find setting: ' + key});
+    cacheInvalidation = cacheInvalidationHeader(req, result)
+        .then(function addCacheHeader(header) {
+            if (header) {
+                res.set({'X-Cache-Invalidate': header});
             }
-            if (!_.isString(value)) {
-                value = JSON.stringify(value);
-            }
-            setting.set('value', value);
-            return dataProvider.Settings.edit(setting).then(function (result) {
-                ghost.settings()[_.first(result).attributes.key].value = _.first(result).attributes.value;
-                return settingsObject(ghost.settings());
-            }, errors.logAndThrowError);
         });
+
+    ops.push(cacheInvalidation);
+
+    if (req.method === 'POST') {
+        location = locationHeader(req, result)
+            .then(function addLocationHeader(header) {
+                if (header) {
+                    res.set({Location: header});
+                    // The location header indicates that a new object was created.
+                    // In this case the status code should be 201 Created
+                    res.status(201);
+                }
+            });
+        ops.push(location);
     }
+
+    if (apiMethod === db.exportContent) {
+        contentDisposition = contentDispositionHeader()
+            .then(function addContentDispositionHeader(header) {
+                // Add Content-Disposition Header
+                if (apiMethod === db.exportContent) {
+                    res.set({
+                        'Content-Disposition': header
+                    });
+                }
+            });
+        ops.push(contentDisposition);
+    }
+
+    return Promise.all(ops);
 };
 
-// ## Request Handlers
-
-function invalidateCache(req, res, result) {
-    var parsedUrl = req._parsedUrl.pathname.replace(/\/$/, '').split('/'),
-        method = req.method,
-        endpoint = parsedUrl[4],
-        id = parsedUrl[5],
-        cacheInvalidate,
-        jsonResult = result.toJSON ? result.toJSON() : result;
-
-    if (method === 'POST' || method === 'PUT' || method === 'DELETE') {
-        if (endpoint === 'settings' || endpoint === 'users') {
-            cacheInvalidate = "/*";
-        } else if (endpoint === 'posts') {
-            cacheInvalidate = "/, /page/*, /rss/, /rss/*";
-            if (id && jsonResult.slug) {
-                cacheInvalidate += ', /' + jsonResult.slug + '/';
-            }
-        }
-        if (cacheInvalidate) {
-            res.set({
-                "X-Cache-Invalidate": cacheInvalidate
-            });
-        }
-    }
-}
-
-// ### requestHandler
-// decorator for api functions which are called via an HTTP request
-// takes the API method and wraps it so that it gets data from the request and returns a sensible JSON response
-requestHandler = function (apiMethod) {
+/**
+ * ### HTTP
+ *
+ * Decorator for API functions which are called via an HTTP request. Takes the API method and wraps it so that it gets
+ * data from the request and returns a sensible JSON response.
+ *
+ * @public
+ * @param {Function} apiMethod API method to call
+ * @return {Function} middleware format function to be called by the route when a matching request is made
+ */
+http = function (apiMethod) {
     return function (req, res) {
-        var options = _.extend(req.body, req.query, req.params),
-            apiContext = {
-                user: req.session && req.session.user
-            },
-            root = ghost.blogGlobals().path === '/' ? '' : ghost.blogGlobals().path,
-            postRouteIndex,
-            i;
-
-        // If permalinks have changed, find old post route
-        if (req.body.permalinks && req.body.permalinks !== ghost.settings('permalinks')) {
-            for (i = 0; i < req.app.routes.get.length; i += 1) {
-                if (req.app.routes.get[i].path === root + ghost.settings('permalinks')) {
-                    postRouteIndex = i;
-                    break;
+        // We define 2 properties for using as arguments in API calls:
+        var object = req.body,
+            response,
+            options = _.extend({}, req.files, req.query, req.params, {
+                context: {
+                    user: (req.user && req.user.id) ? req.user.id : null
                 }
-            }
+            });
+
+        // If this is a GET, or a DELETE, req.body should be null, so we only have options (route and query params)
+        // If this is a PUT, POST, or PATCH, req.body is an object
+        if (_.isEmpty(object)) {
+            object = options;
+            options = {};
         }
 
-        return apiMethod.call(apiContext, options).then(function (result) {
-            // Reload post route
-            if (postRouteIndex) {
-                req.app.get(ghost.settings('permalinks'), req.app.routes.get.splice(postRouteIndex, 1)[0].callbacks);
-            }
-
-            invalidateCache(req, res, result);
-            res.json(result || {});
-        }, function (error) {
-            var errorCode = error.errorCode || 500,
-                errorMsg = {error: _.isString(error) ? error : (_.isObject(error) ? error.message : 'Unknown API Error')};
-            res.json(errorCode, errorMsg);
-        });
+        return apiMethod(object, options)
+            // Handle adding headers
+            .then(function onSuccess(result) {
+                response = result;
+                // Add X-Cache-Invalidate header
+                return addHeaders(apiMethod, req, res, result);
+            }).then(function () {
+                // #### Success
+                // Send a properly formatting HTTP response containing the data with correct headers
+                res.json(response || {});
+            }).catch(function onError(error) {
+                errors.logError(error);
+                // #### Error
+                var httpErrors = formatHttpErrors(error);
+                // Send a properly formatted HTTP response containing the errors
+                res.status(httpErrors.statusCode).json({errors: httpErrors.errors});
+            });
     };
 };
 
-// Public API
-module.exports.posts = posts;
-module.exports.users = users;
-module.exports.tags = tags;
-module.exports.notifications = notifications;
-module.exports.settings = settings;
-module.exports.db = db;
-module.exports.requestHandler = requestHandler;
+/**
+ * ## Public API
+ */
+module.exports = {
+    // Extras
+    init: init,
+    http: http,
+    // API Endpoints
+    configuration: configuration,
+    db: db,
+    mail: mail,
+    notifications: notifications,
+    posts: posts,
+    roles: roles,
+    settings: settings,
+    tags: tags,
+    themes: themes,
+    users: users,
+    slugs: slugs,
+    authentication: authentication,
+    uploads: uploads
+};
+
+/**
+ * ## API Methods
+ *
+ * Most API methods follow the BREAD pattern, although not all BREAD methods are available for all resources.
+ * Most API methods have a similar signature, they either take just `options`, or both `object` and `options`.
+ * For RESTful resources `object` is always a model object of the correct type in the form `name: [{object}]`
+ * `options` is an object with several named properties, the possibilities are listed for each method.
+ *
+ * Read / Edit / Destroy routes expect some sort of identifier (id / slug / key) for which object they are handling
+ *
+ * All API methods take a context object as one of the options:
+ *
+ * @typedef context
+ * Context provides information for determining permissions. Usually a user, but sometimes an app, or the internal flag
+ * @param {Number} user (optional)
+ * @param {String} app (optional)
+ * @param {Boolean} internal (optional)
+ */
