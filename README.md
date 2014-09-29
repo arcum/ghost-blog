@@ -38,3 +38,9 @@ heroku config:set POSTGRES_DATABASE=<value> \
 `git push heroku master`
 
 Enjoy! Go to http://your-url.com/ghost/signup/ to start.
+
+## Contributors
+
+Check them all at:
+
+https://github.com/patrickespake/ghostblog-heroku/graphs/contributors
