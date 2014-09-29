@@ -44,3 +44,7 @@ Enjoy! Go to http://your-url.com/ghost/signup/ to start.
 Check them all at:
 
 https://github.com/patrickespake/ghostblog-heroku/graphs/contributors
+
+## Sample
+
+Visit: http://ghostblog-github.herokuapp.com/
